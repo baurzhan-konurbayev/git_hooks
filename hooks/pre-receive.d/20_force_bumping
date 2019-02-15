@@ -4,28 +4,160 @@
 # < old-value > SP < new-value > SP < ref-name > LF
 # http://stackoverflow.com/questions/2569960/git-pre-receive-hook
 
-# Simple function, just for ease of testing
-def correct_message?(msg)
-  msg.include?("super")
-end
+require 'mixlib/shellout'
 
-# enforced custom commit message format
-def check_message_format
-  missed_revs = `git rev-list #{$rev_old}..#{$rev_new}`.split("\n")
-  missed_revs.each do |rev|
-    message = `git cat-file commit #{rev} | sed '1,/^$/d'`
-      if correct_message?(message)
-        return
-      end
+class Cookbook
+  attr_accessor :name, :modified_files, :metadata_before, :metadata_after
+
+  def initialize(name, modified_files = [])
+    @name = name
+    @modified_files = modified_files
   end
-  STDERR.puts "[git-hook] Your commit #{ rev } was rejected."
-  STDERR.puts "[git-hook] Does it contain super?"
-  exit 1
+
+  def metadata_filepath
+    "cookbooks/#{@name}/metadata.rb"
+  end
+
+  def metadata_modified?
+    @modified_files.include?(metadata_filepath)
+  end
+
+  def version_bumped?
+    v1 = version_before
+    v2 = version_after
+    parts1 = v1.split('.').map { |ver_group| ver_group.to_i}
+    parts2 = v2.split('.').map { |ver_group| ver_group.to_i}
+
+    if parts1[0]>parts2[0]
+      return false
+    elsif parts1[0]==parts2[0]
+      if parts1[1]>parts2[1]
+        return false
+      elsif parts1[1]==parts2[1]
+        if parts1[2]>=parts2[2]
+          return false
+        end
+      end
+    end
+    true
+  end
+
+  def version_before
+    version_string = search_version(@metadata_before)
+    version_string.nil? ? '0.0.0' : version_string
+  end
+
+  def version_after
+    version_string = search_version(@metadata_after)
+    if version_string.nil?
+      STDERR.puts "[git-hook] Couldn't find version in the metadata file of cookbook #{@name}"
+      exit 1
+    end
+    version_string
+  end
+
+  def search_version(metadata_content)
+    version_line = metadata_content.match(/version[[:blank:]]+['"]{1}\d+\.\d+\.\d+['"]{1}/)
+    return nil if metadata_content.nil?
+    version_string = version_line[0].match(/\d+\.\d+\.\d+/)
+    version_string[0]
+  end
+
 end
 
-# The "main" method ... when executing this file:
-#Only run this if the file itself is being executed
-if __FILE__ == $0
-  $rev_old, $rev_new, $ref = STDIN.read.split(" ")
-  check_message_format
+class ChangeSet
+  attr_accessor :all_modified_files, :cookbooks
+
+  def initialize(rev_old, rev_new, ref)
+    @rev_old = rev_old
+    @rev_new = rev_new
+    @ref = ref
+  end
+
+  def has_unbumped_cookbooks?
+    result = false
+    @cookbooks.each do |cookbook|
+      unless cookbook.metadata_modified?
+        STDERR.puts "[git-hook] Cookbook version of '#{cookbook.name}' needs to be bumped!"
+        result = true
+        next
+      end
+      cookbook.metadata_before =
+        begin
+          safe_shellout("git show #{@rev_old}:#{cookbook.metadata_filepath}")
+        rescue
+          "version '0.0.0'"
+        end
+      cookbook.metadata_after = safe_shellout("git show #{@rev_new}:#{cookbook.metadata_filepath}")
+      unless cookbook.version_bumped?
+        STDERR.puts "[git-hook] Version of cookbook '#{cookbook.name}' needs to be bumped!"
+        result = true
+        next
+      end
+
+    end
+    result
+  end
+
 end
+
+class ChangeSetBuilder
+
+  def initialize(rev_old, rev_new, ref)
+    @rev_old = rev_old
+    @rev_new = rev_new
+    @ref = ref
+    @change_set = ChangeSet.new(rev_old, rev_new, ref)
+  end
+
+  def build
+    build_modified_files
+    build_cookbooks
+  end
+
+  def change_set
+    @change_set
+  end
+
+  def build_modified_files
+    cmd_stdout = safe_shellout("git diff --name-only #{@rev_old} #{@rev_new}")
+    @change_set.all_modified_files = cmd_stdout.split("\n")
+  end
+
+  def build_cookbooks
+    @change_set.cookbooks = []
+    all_cookbook_names = []
+    @change_set.all_modified_files.each do |modified_file|
+      if modified_file.start_with?('cookbooks') && modified_file.include?('/')
+        cookbook_name  = modified_file.split('/')[1]
+        all_cookbook_names << cookbook_name unless all_cookbook_names.include?(cookbook_name)
+      end
+    end
+    all_cookbook_names.each do |cookbook_name|
+      cookbook = Cookbook.new(cookbook_name)
+      cookbook.modified_files = @change_set.all_modified_files.select { |modified_file| modified_file.include?(cookbook_name)}
+      @change_set.cookbooks << cookbook
+    end
+  end
+
+end
+
+def safe_shellout(cmd)
+  shellout_obj = Mixlib::ShellOut.new(cmd)
+  shellout_obj.run_command
+  if shellout_obj.exitstatus.to_i != 0
+    raise "Failed to run command #{cmd}, reason: #{shellout_obj.stderr}"	  
+  end
+  shellout_obj.stdout
+end
+
+if __FILE__ == $0
+  rev_old, rev_new, ref = STDIN.read.split(" ")
+  change_set_builder = ChangeSetBuilder.new(rev_old, rev_new, ref)
+  change_set_builder.build
+  change_set = change_set_builder.change_set
+  if change_set.has_unbumped_cookbooks?
+    exit 1
+  end
+end
+
